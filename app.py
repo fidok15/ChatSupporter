@@ -3,6 +3,7 @@
 Run: uv run uvicorn app:main_app --factory --port 8000
 """
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -34,18 +35,23 @@ class ChatOut(BaseModel):
 def create_app(bot) -> FastAPI:
     app = FastAPI(title="GPU Warehouse support")
     sessions: dict[str, tools.Session] = {}
+    locks: dict[str, threading.Lock] = {}  # one per session: a session handles one message at a time
+    sessions_lock = threading.Lock()  # guards sessions and locks (sync endpoints run in a threadpool)
     app.state.sessions = sessions
 
-    def get_session(session_id: str | None) -> tools.Session:
+    def get_session(session_id: str | None) -> tuple[tools.Session, threading.Lock]:
         now = time.time()
-        for sid in [sid for sid, s in sessions.items() if now - s.last_seen > SESSION_TTL]:
-            del sessions[sid]
-        session = sessions.get(session_id or "")
-        if session is None:  # never trust a client-chosen id: unknown ids get a fresh server-made session
-            session = tools.Session(id=secrets.token_urlsafe(16))
-            sessions[session.id] = session
-        session.last_seen = now
-        return session
+        with sessions_lock:
+            for sid in [sid for sid, s in sessions.items() if now - s.last_seen > SESSION_TTL]:
+                del sessions[sid]
+                del locks[sid]
+            session = sessions.get(session_id or "")
+            if session is None:  # never trust a client-chosen id: unknown ids get a fresh server-made session
+                session = tools.Session(id=secrets.token_urlsafe(16))
+                sessions[session.id] = session
+                locks[session.id] = threading.Lock()
+            session.last_seen = now
+            return session, locks[session.id]
 
     @app.get("/")
     def index():
@@ -53,16 +59,17 @@ def create_app(bot) -> FastAPI:
 
     @app.post("/chat", response_model=ChatOut)
     def chat(body: ChatIn):
-        session = get_session(body.session_id)
-        now = time.time()
-        session.message_times = [t for t in session.message_times if now - t < 60]
-        if len(session.message_times) >= RATE_LIMIT:
-            raise HTTPException(429, "Za dużo wiadomości, odczekaj minutę. / Too many messages, wait a minute.")
-        session.message_times.append(now)
-        try:
-            reply = bot.reply(session, body.message)
-        except openai.APIConnectionError:  # includes APITimeoutError
-            raise HTTPException(503, UNAVAILABLE)
+        session, lock = get_session(body.session_id)
+        with lock:  # same session: rate check and reply run one at a time; other sessions run in parallel
+            now = time.time()
+            session.message_times = [t for t in session.message_times if now - t < 60]
+            if len(session.message_times) >= RATE_LIMIT:
+                raise HTTPException(429, "Za dużo wiadomości, odczekaj minutę. / Too many messages, wait a minute.")
+            session.message_times.append(now)
+            try:
+                reply = bot.reply(session, body.message)
+            except openai.APIConnectionError:  # includes APITimeoutError
+                raise HTTPException(503, UNAVAILABLE)
         return ChatOut(session_id=session.id, reply=reply)
 
     return app
