@@ -68,7 +68,7 @@ def create_app(bot) -> FastAPI:
             session.message_times.append(now)
             try:
                 reply = bot.reply(session, body.message)
-            except openai.APIConnectionError:  # includes APITimeoutError
+            except openai.APIError:  # connection, timeout, missing model, ...
                 raise HTTPException(503, UNAVAILABLE)
         return ChatOut(session_id=session.id, reply=reply)
 

@@ -267,3 +267,23 @@ def test_pending_cancel_does_not_carry_over_to_another_verified_order(ctx, db):
     out = run(ctx, "cancel_order")
     assert out.get("confirm_required") is True
     assert db.execute("SELECT status FROM orders WHERE order_id = ?", (b["order_id"],)).fetchone()[0] == "pending"
+
+
+def test_mask_name_masks_short_words():
+    assert tools.mask_name("Jo Li") == "J*** L***"
+    assert tools.mask_name("Jan Kowalski") == "J*** K***"
+
+
+def test_create_order_masks_short_name(ctx):
+    user_says(ctx, "zamawiam")
+    out = tools.dispatch(ctx, "create_order", json.dumps({**ORDER, "name": "Jo Li"}))
+    assert "Jo Li" not in out
+
+
+def test_dispatch_contains_tool_exceptions(ctx, monkeypatch):
+    def boom(ctx, *a):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    fn, model = tools.TOOLS["order_status"]
+    monkeypatch.setitem(tools.TOOLS, "order_status", (boom, model))
+    assert json.loads(tools.dispatch(ctx, "order_status", "{}")) == {"error": "tool failed; offer handoff_to_human"}

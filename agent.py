@@ -20,7 +20,7 @@ FALLBACK_REPLY = (
     "Nie udało mi się tego załatwić. Mogę przekazać sprawę konsultantowi. / "
     "I could not complete this. I can pass it to a human agent."
 )
-THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+THINK_RE = re.compile(r"<think>.*?(?:</think>|$)", re.DOTALL)
 
 # llm(messages, tool_schemas) -> {"content": str | None, "tool_calls": [{"id", "name", "arguments"}], "usage": {...}}
 LLM = Callable[[list[dict], list[dict]], dict]

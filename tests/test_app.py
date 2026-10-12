@@ -109,3 +109,12 @@ def test_concurrent_mixed_load_no_server_errors_and_rate_limit_holds():
     assert set(statuses) <= {200, 429}
     shared_ok = [r for r, j in zip(responses, jobs) if j.get("session_id") == shared and r.status_code == 200]
     assert len(shared_ok) <= app_module.RATE_LIMIT - 1  # the seed message counts too
+
+
+def test_missing_model_returns_503():
+    req = httpx.Request("POST", "http://localhost:11434/v1/chat/completions")
+    err = openai.APIStatusError("model not found", response=httpx.Response(404, request=req), body=None)
+    _, c = client(FakeBot(exc=err))
+    r = c.post("/chat", json={"message": "hej"})
+    assert r.status_code == 503
+    assert "niedostępna" in r.json()["detail"]

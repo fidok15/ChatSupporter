@@ -140,3 +140,9 @@ def test_history_is_trimmed(shop):
     # system message + last 20 history messages, taken after the new user message was appended
     assert len(sent) == 1 + agent.HISTORY_MESSAGES
     assert sent[-1]["content"] == "<user_message>pytanie 14</user_message>"
+
+
+def test_unclosed_think_falls_back(shop):
+    path, _ = shop
+    bot = make_bot(path, say("<think>\nplan"))
+    assert bot.reply(tools.Session(id="s"), "hej") == agent.FALLBACK_REPLY

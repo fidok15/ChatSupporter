@@ -1,5 +1,6 @@
 """Bot tools: SQLite access, session-bound order actions, wiki reads."""
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -102,6 +103,11 @@ def mask_text(text: str) -> str:
     return re.sub(r"[^\W\d_]{3,}", lambda m: m.group()[0] + "***", text)
 
 
+def mask_name(name: str) -> str:
+    """'Jo Li' -> 'J*** L***'. Masks every letter run, however short."""
+    return re.sub(r"[^\W\d_]+", lambda m: m.group()[0] + "***", name)
+
+
 def mask_email(email: str) -> str:
     local, _, domain = email.partition("@")
     return f"{local[:1]}***@{domain}"
@@ -127,7 +133,7 @@ def _order_view(db: sqlite3.Connection, order_id: str) -> dict:
         "total": fmt_pln(o["total_grosze"]),
         "created": o["created_at"][:10],
         "email": mask_email(o["email"]),
-        "name": mask_text(o["ship_name"]),
+        "name": mask_name(o["ship_name"]),
         "address": mask_text(o["ship_address"]),
     }
 
@@ -240,7 +246,7 @@ def create_order(ctx: Ctx, args: CreateOrderArgs) -> dict:
         "draft": True,
         "items": [{"name": name, "qty": qty, "price": fmt_pln(price)} for _, name, qty, price in lines],
         "total": fmt_pln(total),
-        "name": mask_text(args.name),
+        "name": mask_name(args.name),
         "email": mask_email(args.email),
         "address": mask_text(args.address),
         "next": "show this summary and ask the customer to reply 'tak' or 'yes' to confirm",
@@ -347,10 +353,15 @@ def dispatch(ctx: Ctx, name: str, arguments: str) -> str:
     fn, model = entry
     try:
         raw = json.loads(arguments or "{}")
-        result = fn(ctx, model.model_validate(raw)) if model else fn(ctx)
+        args = model.model_validate(raw) if model else None
     except json.JSONDecodeError:
-        result = {"error": "arguments are not valid JSON"}
+        return json.dumps({"error": "arguments are not valid JSON"})
     except ValidationError as e:
         details = [f"{'.'.join(map(str, err['loc'])) or 'arguments'}: {err['msg']}" for err in e.errors()]
-        result = {"error": "invalid arguments", "details": details}
+        return json.dumps({"error": "invalid arguments", "details": details}, ensure_ascii=False)
+    try:
+        result = fn(ctx, args) if model else fn(ctx)
+    except Exception:
+        logging.getLogger(__name__).exception("tool %s failed", name)
+        result = {"error": "tool failed; offer handoff_to_human"}
     return json.dumps(result, ensure_ascii=False)
