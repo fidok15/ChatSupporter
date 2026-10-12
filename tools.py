@@ -4,10 +4,12 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 ROOT = Path(__file__).parent
 WIKI_DIR = ROOT / "wiki"
@@ -168,11 +170,171 @@ def order_status(ctx: Ctx) -> dict:
     return _order_view(ctx.db, ctx.session.verified_order)
 
 
+MAX_ORDERS_PER_SESSION = 3
+CONFIRMATIONS = {"tak", "potwierdzam", "tak potwierdzam", "yes", "confirm", "yes confirm"}
+EMAIL_PATTERN = r"^[\w.+-]+@[\w-]+(\.[\w-]+)+$"
+
+
+def is_confirmation(text: str) -> bool:
+    return " ".join(re.sub(r"[^\w\s]", " ", text.lower()).split()) in CONFIRMATIONS
+
+
+def _ask_confirmation(s: Session, action: str) -> None:
+    s.pending, s.pending_turn = action, s.turn
+
+
+def _confirmed(s: Session, action: str) -> bool:
+    """True only if the customer's very next message after the summary is a bare confirmation.
+    Consumes the confirmation, so one "tak" allows exactly one action."""
+    ok = s.pending == action and s.pending_turn == s.turn - 1 and is_confirmation(s.last_user_text)
+    if ok:
+        s.pending = None
+    return ok
+
+
+def _clean(value: str) -> str:
+    return "".join(ch for ch in value if unicodedata.category(ch)[0] != "C").strip()
+
+
+class Item(BaseModel):
+    product_id: str = Field(max_length=40)
+    qty: int = Field(ge=1, le=5)
+
+
+class CreateOrderArgs(BaseModel):
+    items: list[Item] = Field(min_length=1, max_length=6)
+    name: str = Field(min_length=3, max_length=80)
+    email: str = Field(max_length=120, pattern=EMAIL_PATTERN)
+    address: str = Field(min_length=10, max_length=200)
+
+    @field_validator("name", "address")
+    @classmethod
+    def strip_control_chars(cls, v: str) -> str:
+        return _clean(v)
+
+
+class HandoffArgs(BaseModel):
+    reason: str = Field(max_length=300)
+
+
+def create_order(ctx: Ctx, args: CreateOrderArgs) -> dict:
+    s = ctx.session
+    if len(s.created_orders) >= MAX_ORDERS_PER_SESSION:
+        return {"error": "order limit reached for this conversation; offer handoff_to_human"}
+    lines, total = [], 0
+    for item in args.items:
+        p = ctx.db.execute(
+            "SELECT name, price_grosze, in_stock FROM products WHERE product_id = ?", (item.product_id,)
+        ).fetchone()
+        if p is None:
+            return {"error": f"unknown product_id: {item.product_id}; product ids are the gpu/ page names in the wiki"}
+        if not p["in_stock"]:
+            return {"error": f"out of stock: {p['name']}"}
+        lines.append((item.product_id, p["name"], item.qty, p["price_grosze"]))
+        total += item.qty * p["price_grosze"]  # price always from the DB, never from the model
+    s.draft = {"name": args.name, "email": args.email, "address": args.address, "lines": lines, "total": total}
+    _ask_confirmation(s, "confirm_order")
+    return {
+        "draft": True,
+        "items": [{"name": name, "qty": qty, "price": fmt_pln(price)} for _, name, qty, price in lines],
+        "total": fmt_pln(total),
+        "name": mask_text(args.name),
+        "email": mask_email(args.email),
+        "address": mask_text(args.address),
+        "next": "show this summary and ask the customer to reply 'tak' or 'yes' to confirm",
+    }
+
+
+def confirm_order(ctx: Ctx) -> dict:
+    s, db = ctx.session, ctx.db
+    if s.draft is None:
+        return {"error": "no draft order; call create_order first"}
+    if len(s.created_orders) >= MAX_ORDERS_PER_SESSION:
+        return {"error": "order limit reached for this conversation; offer handoff_to_human"}
+    if not _confirmed(s, "confirm_order"):
+        return {"error": "the customer has not confirmed; show the summary and ask them to reply 'tak' or 'yes'"}
+    d, oid = s.draft, new_order_id()
+    with db:
+        db.execute(
+            "INSERT INTO orders VALUES (?,?,?,?,?,?,?,?)",
+            (oid, d["email"], d["name"], d["address"], "pending", None, d["total"],
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        db.executemany(
+            "INSERT INTO order_items VALUES (?,?,?,?)", [(oid, pid, qty, price) for pid, _, qty, price in d["lines"]]
+        )
+    s.draft = None
+    s.created_orders.append(oid)
+    s.verified_order = oid
+    return {**_order_view(db, oid), "created": True}  # after the spread: view's "created" is the date
+
+
+def cancel_order(ctx: Ctx) -> dict:
+    s, db = ctx.session, ctx.db
+    if not s.verified_order:
+        return {"error": NOT_VERIFIED}
+    view = _order_view(db, s.verified_order)
+    if view["status"] != "pending":
+        return {"error": "only pending orders can be cancelled; offer handoff_to_human"}
+    if not _confirmed(s, "cancel_order"):
+        _ask_confirmation(s, "cancel_order")
+        return {"confirm_required": True, **view, "next": "ask the customer to reply 'tak' or 'yes' to cancel"}
+    with db:
+        db.execute("UPDATE orders SET status = 'cancelled' WHERE order_id = ? AND status = 'pending'", (s.verified_order,))
+    return {"cancelled": True, **_order_view(db, s.verified_order)}
+
+
+def handoff_to_human(ctx: Ctx, args: HandoffArgs) -> dict:
+    LOG_DIR.mkdir(exist_ok=True)
+    entry = {"time": datetime.now().isoformat(timespec="seconds"), "session": ctx.session.id, "reason": _clean(args.reason)}
+    with open(LOG_DIR / "handoffs.jsonl", "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"handed_off": True, "next": "tell the customer a human agent will contact them; give the contact details from policies/contact"}
+
+
 TOOLS = {
     "read_wiki": (read_wiki, WikiArgs),
     "verify_order": (verify_order, VerifyArgs),
     "order_status": (order_status, None),
+    "create_order": (create_order, CreateOrderArgs),
+    "confirm_order": (confirm_order, None),
+    "cancel_order": (cancel_order, None),
+    "handoff_to_human": (handoff_to_human, HandoffArgs),
 }
+
+
+def _fn(name: str, description: str, properties: dict | None = None, required: list[str] | None = None) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": properties or {}, "required": required or []},
+        },
+    }
+
+
+TOOL_SCHEMAS = [
+    _fn("read_wiki", "Read one page of the shop wiki. Start with page 'index' to see all pages.",
+        {"page": {"type": "string", "description": "Page name from the index, e.g. 'gpu/rtx-5090'."}}, ["page"]),
+    _fn("verify_order", "Verify the customer with order number and email. Required before any order action.",
+        {"order_id": {"type": "string", "description": "Format GPU-XXXX-XXXX."},
+         "email": {"type": "string", "description": "Email used for the order."}}, ["order_id", "email"]),
+    _fn("order_status", "Status of the verified order."),
+    _fn("create_order", "Prepare a new order draft and return its summary. Does not place the order.",
+        {"items": {"type": "array", "items": {"type": "object", "properties": {
+            "product_id": {"type": "string", "description": "Wiki page name without 'gpu/', e.g. 'rtx-5090'."},
+            "qty": {"type": "integer", "minimum": 1, "maximum": 5}}, "required": ["product_id", "qty"]}},
+         "name": {"type": "string", "description": "Customer full name."},
+         "email": {"type": "string"},
+         "address": {"type": "string", "description": "Full shipping address in Poland."}},
+        ["items", "name", "email", "address"]),
+    _fn("confirm_order", "Place the drafted order. Works only right after the customer replied 'tak' or 'yes' to the summary."),
+    _fn("cancel_order", "Cancel the verified order if it is pending. The first call returns a summary to confirm; "
+        "call again after the customer replied 'tak' or 'yes'."),
+    _fn("handoff_to_human", "Hand the conversation over to a human agent.",
+        {"reason": {"type": "string", "description": "Short reason, e.g. 'return request'."}}, ["reason"]),
+]
 
 
 def dispatch(ctx: Ctx, name: str, arguments: str) -> str:

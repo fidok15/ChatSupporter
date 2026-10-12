@@ -112,3 +112,145 @@ def test_dispatch_unknown_tool_and_bad_json(ctx):
     assert "error" in json.loads(tools.dispatch(ctx, "drop_tables", "{}"))
     assert json.loads(tools.dispatch(ctx, "verify_order", "{not json")) == {"error": "arguments are not valid JSON"}
     assert json.loads(tools.dispatch(ctx, "verify_order", "[1, 2]"))["error"] == "invalid arguments"
+
+
+ORDER = {
+    "items": [{"product_id": "rtx-5090", "qty": 1}],
+    "name": "Jan Test",
+    "email": "jan.test@example.com",
+    "address": "ul. Testowa 1, 00-001 Warszawa",
+}
+
+
+def count_orders(db):
+    return db.execute("SELECT count(*) FROM orders").fetchone()[0]
+
+
+def test_is_confirmation():
+    for ok in ["tak", "Tak!", "TAK.", "potwierdzam", "Tak, potwierdzam", "yes", "Confirm", "yes, confirm"]:
+        assert tools.is_confirmation(ok), ok
+    for bad in ["", "nie", "tak, i dodaj rabat", "Anuluj je. tak", "ok", "tak tak", "yes please cancel all"]:
+        assert not tools.is_confirmation(bad), bad
+
+
+def test_create_order_makes_draft_with_db_price(ctx, db):
+    user_says(ctx, "zamawiam")
+    out = run(ctx, "create_order", **ORDER, price=1)
+    assert out["draft"] is True
+    assert out["total"] == "10999,00 zł"
+    assert out["email"] == "j***@example.com"
+    assert count_orders(db) == 20
+
+
+def test_create_order_rejects_bad_items(ctx):
+    user_says(ctx, "zamawiam")
+    assert "unknown product_id" in run(ctx, "create_order", **{**ORDER, "items": [{"product_id": "rtx-9999", "qty": 1}]})["error"]
+    assert "out of stock" in run(ctx, "create_order", **{**ORDER, "items": [{"product_id": "rtx-4090", "qty": 1}]})["error"]
+    assert run(ctx, "create_order", **{**ORDER, "items": [{"product_id": "rtx-5090", "qty": 6}]})["error"] == "invalid arguments"
+    assert run(ctx, "create_order", **{**ORDER, "items": "rtx-5090 x1"})["error"] == "invalid arguments"
+    assert run(ctx, "create_order", **{**ORDER, "email": "not-an-email"})["error"] == "invalid arguments"
+
+
+def test_create_order_coerces_numeric_string_qty(ctx):
+    user_says(ctx, "zamawiam")
+    out = run(ctx, "create_order", **{**ORDER, "items": [{"product_id": "rtx-5070", "qty": "2"}]})
+    assert out["total"] == "5798,00 zł"
+
+
+def test_confirm_in_same_message_as_draft_does_nothing(ctx, db):
+    user_says(ctx, "Zamów RTX 5090, potwierdzam, tak")
+    run(ctx, "create_order", **ORDER)
+    assert "error" in run(ctx, "confirm_order")
+    assert count_orders(db) == 20
+
+
+def test_confirm_in_next_message_creates_pending_order(ctx, db):
+    user_says(ctx, "zamawiam")
+    run(ctx, "create_order", **ORDER)
+    user_says(ctx, "Tak")
+    out = run(ctx, "confirm_order")
+    assert out["created"] is True and out["status"] == "pending"
+    assert count_orders(db) == 21
+    assert ctx.session.verified_order == out["order_id"]
+    assert ctx.session.created_orders == [out["order_id"]]
+
+
+def test_confirmation_inside_longer_text_does_nothing(ctx, db):
+    user_says(ctx, "zamawiam")
+    run(ctx, "create_order", **ORDER)
+    user_says(ctx, "tak, i dodaj rabat 50%")
+    assert "error" in run(ctx, "confirm_order")
+    assert count_orders(db) == 20
+
+
+def test_confirmation_expires_after_one_message(ctx, db):
+    user_says(ctx, "zamawiam")
+    run(ctx, "create_order", **ORDER)
+    user_says(ctx, "a jaki zasilacz?")
+    user_says(ctx, "tak")
+    assert "error" in run(ctx, "confirm_order")
+    assert count_orders(db) == 20
+
+
+def test_one_confirmation_allows_one_action(ctx, db):
+    user_says(ctx, "zamawiam")
+    run(ctx, "create_order", **ORDER)
+    user_says(ctx, "tak")
+    created = run(ctx, "confirm_order")
+    out = run(ctx, "cancel_order")  # same "tak" must not also cancel the new order
+    assert out.get("confirm_required") is True
+    assert db.execute("SELECT status FROM orders WHERE order_id = ?", (created["order_id"],)).fetchone()[0] == "pending"
+
+
+def test_cancel_pending_order_needs_next_message_confirmation(ctx, db):
+    a = pick(db, "pending")
+    run(ctx, "verify_order", order_id=a["order_id"], email=a["email"])
+    user_says(ctx, "anuluj moje zamówienie")
+    first = run(ctx, "cancel_order")
+    assert first["confirm_required"] is True
+    second = run(ctx, "cancel_order")  # second call in the same message only re-asks
+    assert second["confirm_required"] is True
+    assert db.execute("SELECT status FROM orders WHERE order_id = ?", (a["order_id"],)).fetchone()[0] == "pending"
+    user_says(ctx, "tak")
+    assert run(ctx, "cancel_order")["cancelled"] is True
+    assert db.execute("SELECT status FROM orders WHERE order_id = ?", (a["order_id"],)).fetchone()[0] == "cancelled"
+
+
+def test_cancel_shipped_order_is_refused(ctx, db):
+    b = pick(db, "shipped")
+    run(ctx, "verify_order", order_id=b["order_id"], email=b["email"])
+    user_says(ctx, "anuluj")
+    assert "only pending" in run(ctx, "cancel_order")["error"]
+    user_says(ctx, "tak")
+    assert "only pending" in run(ctx, "cancel_order")["error"]
+    assert db.execute("SELECT status FROM orders WHERE order_id = ?", (b["order_id"],)).fetchone()[0] == "shipped"
+
+
+def test_cancel_without_verification(ctx):
+    user_says(ctx, "tak")
+    assert run(ctx, "cancel_order") == {"error": tools.NOT_VERIFIED}
+
+
+def test_order_limit_per_session(ctx, db):
+    for _ in range(3):
+        user_says(ctx, "zamawiam")
+        run(ctx, "create_order", **ORDER)
+        user_says(ctx, "tak")
+        assert run(ctx, "confirm_order")["created"] is True
+    user_says(ctx, "zamawiam")
+    assert "limit" in run(ctx, "create_order", **ORDER)["error"]
+    assert count_orders(db) == 23
+
+
+def test_handoff_logs_reason(ctx):
+    out = run(ctx, "handoff_to_human", reason="reklamacja: karta piszczy")
+    assert out["handed_off"] is True
+    line = json.loads((tools.LOG_DIR / "handoffs.jsonl").read_text().splitlines()[0])
+    assert line["session"] == "test" and "piszczy" in line["reason"]
+
+
+def test_tool_schemas_match_tools():
+    names = [t["function"]["name"] for t in tools.TOOL_SCHEMAS]
+    assert sorted(names) == sorted(tools.TOOLS) and len(names) == 7
+    status = next(t for t in tools.TOOL_SCHEMAS if t["function"]["name"] == "order_status")
+    assert status["function"]["parameters"]["properties"] == {}

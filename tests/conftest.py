@@ -29,7 +29,7 @@ def ctx(db, tmp_path, monkeypatch):
     return tools.Ctx(tools.Session(id="test"), db, tools.wiki_pages())
 
 
-def run(ctx, name, **args):
+def run(ctx, name, /, **args):
     """Call a tool the way the agent does: JSON in, JSON out."""
     return json.loads(tools.dispatch(ctx, name, json.dumps(args)))
 
