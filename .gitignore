@@ -1,0 +1,6 @@
+sources/pdf/
+__pycache__/
+.venv/
+.env
+*.db
+logs/
