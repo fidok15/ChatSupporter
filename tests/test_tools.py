@@ -254,3 +254,16 @@ def test_tool_schemas_match_tools():
     assert sorted(names) == sorted(tools.TOOLS) and len(names) == 7
     status = next(t for t in tools.TOOL_SCHEMAS if t["function"]["name"] == "order_status")
     assert status["function"]["parameters"]["properties"] == {}
+
+
+def test_pending_cancel_does_not_carry_over_to_another_verified_order(ctx, db):
+    a = pick(db, "pending")
+    b = pick(db, "pending", exclude_email=a["email"])
+    run(ctx, "verify_order", order_id=a["order_id"], email=a["email"])
+    user_says(ctx, "anuluj")
+    assert run(ctx, "cancel_order")["confirm_required"] is True
+    run(ctx, "verify_order", order_id=b["order_id"], email=b["email"])  # same turn, different order
+    user_says(ctx, "tak")
+    out = run(ctx, "cancel_order")
+    assert out.get("confirm_required") is True
+    assert db.execute("SELECT status FROM orders WHERE order_id = ?", (b["order_id"],)).fetchone()[0] == "pending"

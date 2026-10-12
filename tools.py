@@ -160,6 +160,8 @@ def verify_order(ctx: Ctx, args: VerifyArgs) -> dict:
     if row is None:
         s.failed_verifications += 1
         return {"error": NOT_FOUND}
+    if order_id != s.verified_order:
+        s.pending = None  # a pending confirmation was for the previous order, never carry it over
     s.verified_order = order_id
     return {"verified": True, **_order_view(ctx.db, order_id)}
 
