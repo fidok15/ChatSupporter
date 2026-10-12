@@ -13,7 +13,7 @@ ROLE_MARKUP = re.compile(
     r"<\|[^|>]{0,30}\|>"
     r"|</?\s*(?:user_message|data|system|assistant|tool|think)\s*>"
     r"|\[/?INST\]"
-    r"|^\s*#{2,}\s*(?:system|assistant|user)\s*:?",
+    r"|^[ \t]*#{2,}[ \t]*(?:system|assistant|user)\b[ \t]*:?",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -29,6 +29,7 @@ OK = Verdict(True)
 
 
 def sanitize(text: str) -> str:
+    text = text[: MAX_INPUT_CHARS * 4]  # bounds CPU before normalization; anything this long is rejected as too_long anyway
     text = unicodedata.normalize("NFKC", text)
     text = "".join(ch for ch in text if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf"))
     previous = None

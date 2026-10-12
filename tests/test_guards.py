@@ -47,3 +47,15 @@ def test_check_input_passes_normal_question():
     v = guards.check_input("Jaki zasilacz do RTX 5090?", CLEAN, lambda m: seen.append(m) or True)
     assert v.ok
     assert seen == [[{"role": "user", "content": "Jaki zasilacz do RTX 5090?"}]]
+
+
+def test_sanitize_keeps_heading_that_starts_like_role():
+    assert guards.sanitize("## Users guide") == "## Users guide"
+
+
+def test_sanitize_caps_input_before_processing():
+    assert len(guards.sanitize("a" * 100_000)) == guards.MAX_INPUT_CHARS * 4
+
+
+def test_sanitize_handles_long_whitespace_run():
+    assert guards.sanitize("\n" * 20000) == ""
