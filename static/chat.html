@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Warehouse Support</title>
+<style>
+  :root { --bg: #f6f7f9; --fg: #1d1f23; --card: #fff; --line: #dde1e6; --accent: #76b900; --err: #b00020; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #15171a; --fg: #e8eaed; --card: #1f2226; --line: #33373d; --err: #ff6b81; }
+  }
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; background: var(--bg); color: var(--fg); }
+  h1 { font-size: 20px; }
+  #log { display: flex; flex-direction: column; gap: 8px; min-height: 60vh; }
+  .msg { padding: 10px 14px; border-radius: 12px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .user { align-self: flex-end; background: var(--accent); color: #fff; }
+  .bot { align-self: flex-start; background: var(--card); border: 1px solid var(--line); }
+  .err { align-self: center; color: var(--err); font-size: 14px; }
+  form { display: flex; gap: 8px; margin-top: 16px; }
+  input { flex: 1; padding: 10px; font-size: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--fg); }
+  button { padding: 10px 16px; font-size: 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; }
+  button:disabled { opacity: 0.5; }
+</style>
+</head>
+<body>
+<h1>GPU Warehouse — wsparcie / support</h1>
+<div id="log" aria-live="polite"></div>
+<form id="form">
+  <input id="input" maxlength="1000" autocomplete="off" placeholder="Napisz wiadomość… / Type a message…" aria-label="Wiadomość / Message">
+  <button>Wyślij</button>
+</form>
+<script>
+let sessionId = null;
+const log = document.getElementById("log");
+const input = document.getElementById("input");
+const form = document.getElementById("form");
+const button = form.querySelector("button");
+
+function add(kind, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + kind;
+  div.textContent = text;  // never parse bot output as HTML
+  log.append(div);
+  div.scrollIntoView({block: "end"});
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const message = input.value.trim();
+  if (!message) return;
+  add("user", message);
+  input.value = "";
+  button.disabled = true;
+  try {
+    const response = await fetch("/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({session_id: sessionId, message}),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      sessionId = data.session_id;
+      add("bot", data.reply);
+    } else {
+      add("err", typeof data.detail === "string" ? data.detail : "Błąd / Error");
+    }
+  } catch {
+    add("err", "Brak połączenia z serwerem. / No connection to the server.");
+  }
+  button.disabled = false;
+  input.focus();
+});
+</script>
+</body>
+</html>
